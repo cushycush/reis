@@ -666,14 +666,50 @@ impl EisRequestConverter {
         };
         match request {
             eis::touchscreen::Request::Release => {
+                // Touch operations wait in `pending_requests` for their device's frame, and
+                // the protocol says they must not be processed without one. Anything this
+                // touchscreen sent but never framed dies with the interface it was sent on:
+                // keeping it would either leak into a later synthesized frame or outlive the
+                // capability entirely. Only this device's touch operations go; another
+                // device's pending work is none of this request's business.
+                self.pending_requests.retain(|pending| {
+                    let is_touch = matches!(
+                        pending,
+                        EisRequest::TouchDown(_)
+                            | EisRequest::TouchUp(_)
+                            | EisRequest::TouchMotion(_)
+                            | EisRequest::TouchCancel(_)
+                    );
+                    !(is_touch && pending.device() == Some(&device))
+                });
+
+                // Remove the touchscreen from both maps. Dropping only the
+                // `device_for_interface` entry leaves it live in the device's own interface
+                // map, which keeps `has_capability` reporting touch the client just gave up
+                // and lets a later `Device::remove` drain and destroy this same object a
+                // second time.
                 self.connection
                     .0
                     .device_for_interface
                     .lock()
                     .unwrap()
                     .remove(touchscreen.as_object());
+                device
+                    .0
+                    .interfaces
+                    .lock()
+                    .unwrap()
+                    .remove(<eis::Touchscreen as Interface>::NAME);
+
                 self.connection
                     .with_next_serial(|serial| touchscreen.destroyed(serial));
+
+                // Queue rather than push straight onto `requests`: high-level requests are
+                // drained only after `handle_request` returns, so queueing is what makes the
+                // release observable to the server at all.
+                self.queue_request(EisRequest::TouchscreenReleased(TouchscreenReleased {
+                    device,
+                }));
             }
             eis::touchscreen::Request::Down { touchid, x, y } => {
                 let mut down_touch_ids = device.0.down_touch_ids.lock().unwrap();
@@ -1193,6 +1229,7 @@ pub enum EisRequest {
     TouchUp(TouchUp),
     TouchMotion(TouchMotion),
     TouchCancel(TouchCancel),
+    TouchscreenReleased(TouchscreenReleased),
     TextKeysym(TextKeysym),
     TextUtf8(TextUtf8),
 }
@@ -1224,7 +1261,8 @@ impl EisRequest {
             | Self::Frame(_)
             | Self::Ready(_)
             | Self::DeviceStartEmulating(_)
-            | Self::DeviceStopEmulating(_) => None,
+            | Self::DeviceStopEmulating(_)
+            | Self::TouchscreenReleased(_) => None,
         }
     }
 
@@ -1251,7 +1289,14 @@ impl EisRequest {
             Self::TouchCancel(evt) => Some(&evt.device),
             Self::TextKeysym(evt) => Some(&evt.device),
             Self::TextUtf8(evt) => Some(&evt.device),
-            Self::Disconnect | Self::Bind(_) | Self::RequestDevice(_) => None,
+            // `TouchscreenReleased` carries a device in its payload but reports none here on
+            // purpose: `queue_request` synthesizes a frame for any device-carrying request
+            // that arrives while other operations are still pending, which would drain those
+            // operations under a frame the client never sent. Read `.device` for the payload.
+            Self::Disconnect
+            | Self::Bind(_)
+            | Self::RequestDevice(_)
+            | Self::TouchscreenReleased(_) => None,
         }
     }
 }
@@ -1320,6 +1365,20 @@ pub struct DeviceStopEmulating {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeviceClosed {
     /// The device the client released.
+    pub device: Device,
+}
+
+/// The client has released just the `ei_touchscreen` interface via
+/// [`ei_touchscreen.release`](eis::touchscreen::Request::Release), while keeping the device.
+///
+/// The interface is already destroyed and removed from the device by the time the server sees
+/// this, and any touch operations the client had not framed yet have been dropped. The server
+/// should release whatever it holds for touches on this device: the protocol says a released
+/// interface is not reinitialized on that device, so no replacement is coming, and any contact
+/// the server had applied will never be lifted by the client.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TouchscreenReleased {
+    /// The device whose touchscreen interface the client released.
     pub device: Device,
 }
 
