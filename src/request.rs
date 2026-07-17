@@ -289,22 +289,57 @@ impl EisRequestConverter {
         }));
     }
 
-    // Based on behavior of `eis_queue_request` in libeis
+    // Whether `device` has operations waiting for a frame to deliver them.
+    fn has_pending_for(&self, device: &Device) -> bool {
+        self.pending_requests
+            .iter()
+            .any(|pending| pending.device() == Some(device))
+    }
+
+    // Based on behavior of `eis_queue_request` in libeis, except that a frame is scoped to the
+    // device it was sent on, which is what `ei_device.frame` means.
     fn queue_request(&mut self, mut request: EisRequest) {
         if request.time_mut().is_some() {
             self.pending_requests.push_back(request);
-        } else if let EisRequest::Frame(Frame { time, .. }) = &request {
-            if self.pending_requests.is_empty() {
-                return;
+        } else if let EisRequest::Frame(Frame { time, device, .. }) = &request {
+            // A frame is the transaction boundary for one device, so it delivers that device's
+            // pending operations and leaves every other device's waiting for a frame of their
+            // own. Draining them all here would hand a client's touches to whichever device
+            // framed first, timestamped as if they had belonged to it.
+            // Rotate the queue through itself rather than taking it. This runs on every frame of
+            // every device, and `mem::take` leaves an empty deque behind, so the survivors'
+            // storage would be re-allocated each time. Popping exactly the starting length keeps
+            // the capacity and the arrival order both: non-matching requests go back in the order
+            // they came out, matching ones leave.
+            let mut delivered = false;
+            for _ in 0..self.pending_requests.len() {
+                let Some(mut pending_request) = self.pending_requests.pop_front() else {
+                    break;
+                };
+                if pending_request.device() == Some(device) {
+                    *pending_request.time_mut().unwrap() = *time;
+                    self.requests.push_back(pending_request);
+                    delivered = true;
+                } else {
+                    self.pending_requests.push_back(pending_request);
+                }
             }
-            for mut pending_request in self.pending_requests.drain(..) {
-                *pending_request.time_mut().unwrap() = *time;
-                self.requests.push_back(pending_request);
+            // A frame that delivered nothing carries no information, so it is dropped rather
+            // than passed on as an empty transaction.
+            if !delivered {
+                return;
             }
             self.requests.push_back(request);
         } else {
+            // A request that names a device but carries no timestamp of its own commits that
+            // device's unframed work first, which is libeis behavior worth keeping. Asking
+            // whether this device has anything pending, rather than whether anyone does, is
+            // belt and braces: the frame arm above would drop a synthesized frame that turned
+            // out to deliver nothing anyway. It saves building a frame only to discard it, and
+            // keeps both halves of this function reasoning per-device rather than leaving one
+            // that only looks right because the other cleans up after it.
             if let Some(device) = request.device() {
-                if !self.pending_requests.is_empty() {
+                if self.has_pending_for(device) {
                     self.queue_frame_event(device);
                 }
             }
@@ -1633,3 +1668,458 @@ impl_device_trait!(TouchMotion; time);
 impl_device_trait!(TouchCancel; time);
 impl_device_trait!(TextKeysym; time);
 impl_device_trait!(TextUtf8; time);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    // The converter needs a handshake response, but not a client that produced one: every
+    // object these tests touch is server-allocated. Faking the response keeps the tests to the
+    // queueing behavior rather than a socket dance.
+    fn all_interfaces() -> HashMap<String, u32> {
+        fn iface<I: Interface>() -> (String, u32) {
+            (I::NAME.to_owned(), I::VERSION)
+        }
+        [
+            iface::<eis::Connection>(),
+            iface::<eis::Callback>(),
+            iface::<eis::Pingpong>(),
+            iface::<eis::Seat>(),
+            iface::<eis::Device>(),
+            iface::<eis::Pointer>(),
+            iface::<eis::PointerAbsolute>(),
+            iface::<eis::Scroll>(),
+            iface::<eis::Button>(),
+            iface::<eis::Keyboard>(),
+            iface::<eis::Touchscreen>(),
+            iface::<eis::Text>(),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    struct Fixture {
+        converter: EisRequestConverter,
+        touch: Device,
+        pointer: Device,
+        // The peer end of the socket. Kept alive so the writes the converter makes have
+        // somewhere to go; nothing reads it.
+        _client: UnixStream,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let (server, client) = UnixStream::pair().unwrap();
+            let context = eis::Context::new(server).unwrap();
+            let connection = context.handshake().connection(1, 1);
+            let converter = EisRequestConverter::new(
+                &context,
+                EisHandshakeResp {
+                    connection,
+                    name: Some("test".to_owned()),
+                    context_type: eis::handshake::ContextType::Sender,
+                    negotiated_interfaces: all_interfaces(),
+                },
+                1,
+            );
+            let seat = converter.handle().add_seat(
+                Some("seat"),
+                DeviceCapability::Touch
+                    | DeviceCapability::PointerAbsolute
+                    | DeviceCapability::Button,
+            );
+            let touch = seat.add_device(
+                Some("touch"),
+                eis::device::DeviceType::Virtual,
+                DeviceCapability::Touch.into(),
+                |_| {},
+            );
+            let pointer = seat.add_device(
+                Some("pointer"),
+                eis::device::DeviceType::Virtual,
+                DeviceCapability::PointerAbsolute | DeviceCapability::Button,
+                |_| {},
+            );
+            Self {
+                converter,
+                touch,
+                pointer,
+                _client: client,
+            }
+        }
+
+        fn touch_down(&mut self, touchid: u32, x: f32, y: f32) {
+            let touchscreen = self.touch.interface::<eis::Touchscreen>().unwrap();
+            self.converter
+                .handle_request(eis::Request::Touchscreen(
+                    touchscreen,
+                    eis::touchscreen::Request::Down { touchid, x, y },
+                ))
+                .unwrap();
+        }
+
+        fn touch_motion(&mut self, touchid: u32, x: f32, y: f32) {
+            let touchscreen = self.touch.interface::<eis::Touchscreen>().unwrap();
+            self.converter
+                .handle_request(eis::Request::Touchscreen(
+                    touchscreen,
+                    eis::touchscreen::Request::Motion { touchid, x, y },
+                ))
+                .unwrap();
+        }
+
+        fn pointer_motion(&mut self, x: f32, y: f32) {
+            let absolute = self.pointer.interface::<eis::PointerAbsolute>().unwrap();
+            self.converter
+                .handle_request(eis::Request::PointerAbsolute(
+                    absolute,
+                    eis::pointer_absolute::Request::MotionAbsolute { x, y },
+                ))
+                .unwrap();
+        }
+
+        fn frame(&mut self, device: &Device, timestamp: u64) {
+            self.converter
+                .handle_request(eis::Request::Device(
+                    device.device().clone(),
+                    eis::device::Request::Frame {
+                        last_serial: 1,
+                        timestamp,
+                    },
+                ))
+                .unwrap();
+        }
+
+        /// Everything the converter is ready to hand to the server, in order.
+        fn drain(&mut self) -> Vec<Delivered> {
+            let mut out = Vec::new();
+            while let Some(request) = self.converter.next_request() {
+                out.push(match request {
+                    EisRequest::TouchDown(event) => Delivered::TouchDown {
+                        device: event.device,
+                        touch_id: event.touch_id,
+                        x: event.x,
+                        time: event.time,
+                    },
+                    EisRequest::TouchMotion(event) => Delivered::TouchMotion {
+                        device: event.device,
+                        touch_id: event.touch_id,
+                        x: event.x,
+                        time: event.time,
+                    },
+                    EisRequest::PointerMotionAbsolute(event) => Delivered::PointerMotion {
+                        device: event.device,
+                        x: event.dx_absolute,
+                        time: event.time,
+                    },
+                    EisRequest::Frame(event) => Delivered::Frame {
+                        device: event.device,
+                        time: event.time,
+                    },
+                    other => Delivered::Other(format!("{other:?}")),
+                });
+            }
+            out
+        }
+    }
+
+    // `x` is carried so that two operations that would otherwise look identical stay
+    // distinguishable, which is what makes the ordering assertions mean anything.
+    #[derive(Debug, PartialEq)]
+    enum Delivered {
+        TouchDown {
+            device: Device,
+            touch_id: u32,
+            x: f32,
+            time: u64,
+        },
+        TouchMotion {
+            device: Device,
+            touch_id: u32,
+            x: f32,
+            time: u64,
+        },
+        PointerMotion {
+            device: Device,
+            x: f32,
+            time: u64,
+        },
+        Frame {
+            device: Device,
+            time: u64,
+        },
+        Other(String),
+    }
+
+    #[test]
+    fn a_frame_delivers_only_its_own_devices_operations() {
+        let mut fixture = Fixture::new();
+        let (touch, pointer) = (fixture.touch.clone(), fixture.pointer.clone());
+
+        fixture.touch_down(1, 10.0, 20.0);
+        fixture.pointer_motion(5.0, 6.0);
+
+        // The pointer frames first. It must take its own motion and nothing else.
+        fixture.frame(&pointer, 999);
+        assert_eq!(
+            fixture.drain(),
+            [
+                Delivered::PointerMotion {
+                    device: pointer.clone(),
+                    x: 5.0,
+                    time: 999
+                },
+                Delivered::Frame {
+                    device: pointer,
+                    time: 999
+                },
+            ],
+            "a frame must not deliver another device's operations"
+        );
+
+        // The touch down is still waiting, and its own frame is what delivers it, stamped with
+        // that frame's timestamp rather than the pointer's.
+        fixture.frame(&touch, 1234);
+        assert_eq!(
+            fixture.drain(),
+            [
+                Delivered::TouchDown {
+                    device: touch.clone(),
+                    touch_id: 1,
+                    x: 10.0,
+                    time: 1234
+                },
+                Delivered::Frame {
+                    device: touch,
+                    time: 1234
+                },
+            ],
+            "a device's own frame should deliver what it had pending"
+        );
+    }
+
+    #[test]
+    fn an_unframed_touch_is_not_stranded_by_another_devices_frame() {
+        let mut fixture = Fixture::new();
+        let (touch, pointer) = (fixture.touch.clone(), fixture.pointer.clone());
+
+        // The sequence that stranded a touch downstream: a touch down, then the pointer frames
+        // before the touch device does. The pointer's frame used to carry the down away, and
+        // the touch's own frame then arrived with nothing left to deliver and was dropped, so
+        // no touch frame ever reached the server and the down sat in its queue.
+        fixture.touch_down(1, 10.0, 20.0);
+        fixture.pointer_motion(5.0, 6.0);
+        fixture.frame(&pointer, 999);
+
+        let after_pointer_frame = fixture.drain();
+        assert!(
+            !after_pointer_frame
+                .iter()
+                .any(|d| matches!(d, Delivered::TouchDown { .. })),
+            "the pointer's frame must not deliver the touch down: {after_pointer_frame:?}"
+        );
+
+        fixture.frame(&touch, 1234);
+        assert_eq!(
+            fixture.drain(),
+            [
+                Delivered::TouchDown {
+                    device: touch.clone(),
+                    touch_id: 1,
+                    x: 10.0,
+                    time: 1234
+                },
+                Delivered::Frame {
+                    device: touch,
+                    time: 1234
+                },
+            ],
+            "the touch's own frame should deliver the down, and must not be dropped"
+        );
+    }
+
+    #[test]
+    fn a_frame_with_nothing_pending_is_dropped() {
+        let mut fixture = Fixture::new();
+        let (touch, pointer) = (fixture.touch.clone(), fixture.pointer.clone());
+
+        // Nothing pending anywhere.
+        fixture.frame(&touch, 100);
+        assert_eq!(
+            fixture.drain(),
+            [],
+            "an empty frame carries nothing to deliver"
+        );
+
+        // Nothing pending for this device, but another device has work waiting. The frame is
+        // still empty as far as the pointer is concerned.
+        fixture.touch_down(1, 10.0, 20.0);
+        fixture.frame(&pointer, 200);
+        assert_eq!(
+            fixture.drain(),
+            [],
+            "a frame is empty when its own device has nothing pending, whatever others hold"
+        );
+
+        // And the touch's work survived that frame.
+        fixture.frame(&touch, 300);
+        assert_eq!(
+            fixture.drain(),
+            [
+                Delivered::TouchDown {
+                    device: touch.clone(),
+                    touch_id: 1,
+                    x: 10.0,
+                    time: 300
+                },
+                Delivered::Frame {
+                    device: touch,
+                    time: 300
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn order_within_a_device_is_preserved() {
+        let mut fixture = Fixture::new();
+        let (touch, pointer) = (fixture.touch.clone(), fixture.pointer.clone());
+
+        // Interleave two devices, so a naive filter that rebuilt the queue could reorder them.
+        fixture.touch_down(1, 10.0, 20.0);
+        fixture.pointer_motion(1.0, 1.0);
+        fixture.touch_motion(1, 11.0, 21.0);
+        fixture.pointer_motion(2.0, 2.0);
+        fixture.touch_motion(1, 12.0, 22.0);
+
+        fixture.frame(&touch, 500);
+        assert_eq!(
+            fixture.drain(),
+            [
+                Delivered::TouchDown {
+                    device: touch.clone(),
+                    touch_id: 1,
+                    x: 10.0,
+                    time: 500
+                },
+                Delivered::TouchMotion {
+                    device: touch.clone(),
+                    touch_id: 1,
+                    x: 11.0,
+                    time: 500
+                },
+                Delivered::TouchMotion {
+                    device: touch.clone(),
+                    touch_id: 1,
+                    x: 12.0,
+                    time: 500
+                },
+                Delivered::Frame {
+                    device: touch,
+                    time: 500
+                },
+            ],
+            "a device's operations should arrive in the order the client sent them"
+        );
+
+        // The pointer's two motions kept their order too, across the touch frame that skipped
+        // over them.
+        fixture.frame(&pointer, 600);
+        assert_eq!(
+            fixture.drain(),
+            [
+                Delivered::PointerMotion {
+                    device: pointer.clone(),
+                    x: 1.0,
+                    time: 600
+                },
+                Delivered::PointerMotion {
+                    device: pointer.clone(),
+                    x: 2.0,
+                    time: 600
+                },
+                Delivered::Frame {
+                    device: pointer,
+                    time: 600
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_termination_synthesizes_a_frame_only_for_its_own_device() {
+        let mut fixture = Fixture::new();
+        let (touch, pointer) = (fixture.touch.clone(), fixture.pointer.clone());
+
+        // reis synthesizes a frame ahead of a request that names a device but carries no
+        // timestamp, which commits that device's unframed work. That stays, but it must not
+        // reach across to another device: a pointer stopping is no reason to commit a touch.
+        fixture.touch_down(1, 10.0, 20.0);
+        fixture
+            .converter
+            .handle_request(eis::Request::Device(
+                pointer.device().clone(),
+                eis::device::Request::StopEmulating { last_serial: 1 },
+            ))
+            .unwrap();
+
+        let delivered = fixture.drain();
+        assert!(
+            !delivered
+                .iter()
+                .any(|d| matches!(d, Delivered::TouchDown { .. } | Delivered::Frame { .. })),
+            "the pointer's stop must not synthesize a frame that commits the touch: {delivered:?}"
+        );
+
+        // The touch's own frame still delivers it.
+        fixture.frame(&touch, 700);
+        assert_eq!(
+            fixture.drain(),
+            [
+                Delivered::TouchDown {
+                    device: touch.clone(),
+                    touch_id: 1,
+                    x: 10.0,
+                    time: 700
+                },
+                Delivered::Frame {
+                    device: touch,
+                    time: 700
+                },
+            ]
+        );
+    }
+
+    /// The positive half of the one above: scoping the synthesis per-device must not stop a
+    /// device's own termination from committing its own unframed work.
+    ///
+    /// Worth its own test because the guard and the frame arm could both be made per-device and
+    /// still, between them, deliver nothing at all. The negative test alone would not notice.
+    #[test]
+    fn a_termination_still_synthesizes_a_frame_for_its_own_device() {
+        let mut fixture = Fixture::new();
+        let touch = fixture.touch.clone();
+
+        fixture.touch_down(1, 10.0, 20.0);
+        fixture
+            .converter
+            .handle_request(eis::Request::Device(
+                touch.device().clone(),
+                eis::device::Request::StopEmulating { last_serial: 1 },
+            ))
+            .unwrap();
+
+        let delivered = fixture.drain();
+        assert!(
+            delivered
+                .iter()
+                .any(|d| matches!(d, Delivered::TouchDown { touch_id: 1, .. })),
+            "the touch device's own stop commits its unframed down: {delivered:?}"
+        );
+        assert!(
+            delivered.iter().any(|d| matches!(d, Delivered::Frame { .. })),
+            "and it arrives under a synthesized frame, which is libeis behavior: {delivered:?}"
+        );
+    }
+}
